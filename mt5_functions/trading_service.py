@@ -1,245 +1,374 @@
-from typing import List, Dict, Optional, Tuple, Any
+from utils.logger import logger
+import mt5_functions.mt5_api as mt5_api
+import utils.constants as const
+import math
 import MetaTrader5 as mt5
-from mt5_functions import mt5_api
 
-class TradingService:
-    def get_account_balance(self) -> Optional[float]:
-        account_info = mt5_api.get_account_info()
-        if account_info:
-            return account_info.get("data", {}).get("balance")
+# Core trading logic functions will go here
+# e.g., calculate_lot, check_drawdown, manage_orders, etc.
+
+# --- Helper Functions ---
+
+def calculate_adjusted_distance(symbol_info, distance_pips):
+    point = symbol_info.point
+    stops_level = symbol_info.trade_stops_level
+    # Convert pips to points (assuming 1 pip = 10 points for 5-digit, 1 point for 3-digit)
+    # More robust check might be needed for exotic symbols
+    pip_multiplier = 10 if symbol_info.digits == 5 or symbol_info.digits == 3 else 1
+    distance_points = distance_pips * pip_multiplier
+
+    adjusted_distance = max(distance_points, stops_level)
+    if adjusted_distance > distance_points:
+        logger.warning(f"Order distance ({distance_pips} pips / {distance_points} points) increased to broker's stops_level ({stops_level} points)")
+    return adjusted_distance
+
+def calculate_initial_lot(symbol_info, account_info):
+    if const.INITIAL_LOT > 0:
+        lot = const.INITIAL_LOT
+        # logger.info(f"Using fixed initial lot: {lot}") # Keep log concise
+    else:
+        balance = account_info.balance
+        percentage = const.BALANCE_PERCENT_FOR_LOT / 100.0
+        target_amount = balance * percentage
+        
+        # Basic calculation: Lot = Target Amount / Margin for 1 Lot
+        tick = mt5_api.get_symbol_tick(symbol_info.name)
+        if not tick:
+             logger.error("Cannot calculate lot based on balance: failed to get tick.")
+             return 0.01 # Fallback to a small default lot
+        
+        margin_required_one_lot = mt5.order_calc_margin(mt5.ORDER_TYPE_BUY, symbol_info.name, 1.0, tick.ask)
+        if not margin_required_one_lot or margin_required_one_lot <= 0:
+            logger.warning(f"Could not calculate margin for {symbol_info.name}. Using fallback balance percentage calc.")
+            # Simplified fallback - might be inaccurate
+            lot = round((balance * percentage) / 1000, 2) 
         else:
-            print(f"Не удалось получить информацию о счете через mt5_api.")
-            return None
+            lot = round(target_amount / margin_required_one_lot, 2)
 
-    def get_available_symbols(self) -> List[Dict[str, any]]:
-        symbols = mt5_api.get_symbols(only_visible=True)
-        if not symbols:
-            print(f"Не удалось получить список символов через mt5_api.")
-            return []
-            
-        return [
-            {
-                "name": symbol.name,
-                "description": f"{symbol.name} - {symbol.description}",
-                "digits": symbol.digits,
-                "point": symbol.point,
-                "trade_mode": symbol.trade_mode,
-                "volume_min": symbol.volume_min,
-                "volume_max": symbol.volume_max,
-                "volume_step": symbol.volume_step
-            }
-            for symbol in symbols
-        ]
+        # logger.info(f"Calculated initial lot based on {const.BALANCE_PERCENT_FOR_LOT}% of balance ({balance}): {lot}") # Keep log concise
 
-    def select_symbol(self, symbol_name: str) -> Tuple[bool, str]:
-        if not mt5_api.select_symbol(symbol_name):
-            return False, f"Не удалось выбрать или найти символ {symbol_name} в MT5."
+    # Ensure lot meets symbol's volume constraints
+    lot = max(lot, symbol_info.volume_min)
+    lot = min(lot, symbol_info.volume_max)
+    if symbol_info.volume_step > 0:
+        lot = math.floor(lot / symbol_info.volume_step) * symbol_info.volume_step
+    
+    lot = round(lot, 2) # Final rounding
+
+    if lot <= 0:
+        logger.error(f"Calculated lot is zero or negative ({lot}). Falling back to minimum volume: {symbol_info.volume_min}")
+        lot = symbol_info.volume_min
+
+    # logger.info(f"Final adjusted initial lot: {lot}") # Log moved to initialize_strategy
+    return lot
+
+# --- Core Logic Functions ---
+
+def initialize_strategy(state):
+    logger.info("Initializing strategy...")
+    symbol = const.SYMBOL
+    magic = const.MAGIC_NUMBER
+
+    # Check if already initialized (orders or positions exist)
+    existing_orders = mt5_api.get_orders(symbol=symbol, magic=magic)
+    existing_positions = mt5_api.get_positions(symbol=symbol, magic=magic)
+
+    if existing_orders or existing_positions:
+        logger.info(f"Strategy already has active orders ({len(existing_orders)}) or positions ({len(existing_positions)}). Initialization skipped.")
+        # TODO: Load state relevant to existing grid (next lots, levels etc.)
+        return False # Indicate no changes made
+
+    logger.info("No existing orders or positions found for this magic number. Placing initial grid.")
+
+    # Get necessary info
+    symbol_info = mt5_api.get_symbol_info(symbol)
+    account_info = mt5_api.get_account_info()
+    tick = mt5_api.get_symbol_tick(symbol)
+
+    if not symbol_info or not account_info or not tick:
+        logger.error("Failed to get required info (symbol, account, tick) for initialization.")
+        return False
+
+    # Calculate parameters
+    initial_lot = calculate_initial_lot(symbol_info, account_info)
+    if initial_lot <= 0:
+        logger.error("Initial lot calculation resulted in zero or negative value. Cannot place orders.")
+        return False
         
-        symbol_info = mt5.symbol_info(symbol_name)
-        if not symbol_info or not symbol_info.trade_mode:
-            return False, f"Торговля по символу {symbol_name} запрещена."
-            
-        return True, f"Символ {symbol_name} доступен для торговли."
+    distance_points = calculate_adjusted_distance(symbol_info, const.ORDER_DISTANCE_PIPS)
+    point = symbol_info.point
+    digits = symbol_info.digits
 
-    def get_symbol_info(self, symbol_name: str) -> Optional[Dict]:
-        symbol_info = mt5_api.get_symbol_info_detailed(symbol_name)
-        if symbol_info is None:
-             print(f"Не удалось получить информацию о символе {symbol_name} через mt5_api.")
-             return None
-            
-        return {
-            "name": symbol_info.name,
-            "description": symbol_info.description,
-            "digits": symbol_info.digits,
-            "point": symbol_info.point,
-            "trade_mode": symbol_info.trade_mode,
-            "volume_min": symbol_info.volume_min,
-            "volume_max": symbol_info.volume_max,
-            "volume_step": symbol_info.volume_step,
-            "spread": symbol_info.spread,
-            "spread_float": symbol_info.spread_float,
-            "trade_stops_level": symbol_info.trade_stops_level,
-            "filling_mode": symbol_info.filling_mode,
-            "visible": symbol_info.visible,
-        }
+    # Calculate prices
+    buy_stop_price = round(tick.ask + distance_points * point, digits)
+    sell_stop_price = round(tick.bid - distance_points * point, digits)
+    
+    # Normalize prices (using mt5 internal might be safer) --> Use Python's round instead
+    # buy_stop_price = mt5.normalize_double(buy_stop_price, digits)
+    # sell_stop_price = mt5.normalize_double(sell_stop_price, digits)
+    # The round() function above already handles the normalization to the correct number of digits.
 
-    def get_grid_status(self, symbol: str, magic_number: int) -> Dict[str, Any]:
-        try:
-            orders_raw = mt5_api.get_active_orders(symbol, magic_number)
-            positions_raw = mt5_api.get_open_positions(symbol, magic_number)
+    logger.info(f"Calculated initial parameters: Lot={initial_lot}, Distance={distance_points} points, BuyStopPrice={buy_stop_price}, SellStopPrice={sell_stop_price}")
 
-            orders_list = [
-                {
-                    "ticket": order.ticket,
-                    "type": mt5_api.order_type_string(order.type),
-                    "price_open": order.price_open,
-                    "volume_initial": order.volume_initial,
-                    "symbol": order.symbol,
-                    "magic": order.magic
-                }
-                for order in orders_raw
-            ]
-            positions_list = [
-                {
-                    "ticket": pos.ticket,
-                    "type": mt5_api.position_type_string(pos.type),
-                    "price_open": pos.price_open,
-                    "volume": pos.volume,
-                    "profit": pos.profit,
-                    "symbol": pos.symbol,
-                    "magic": pos.magic
-                }
-                for pos in positions_raw
-            ]
+    # Prepare requests
+    buy_request = {
+        "action": mt5.TRADE_ACTION_PENDING,
+        "symbol": symbol,
+        "volume": initial_lot,
+        "type": mt5.ORDER_TYPE_BUY_STOP,
+        "price": buy_stop_price,
+        "magic": magic,
+        "comment": "Grid Initial BuyStop",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": symbol_info.filling_mode # Use broker's preferred filling mode
+    }
 
-            return {
-                "success": True,
-                "orders": orders_list,
-                "positions": positions_list,
-                "error": None
-            }
-        except Exception as e:
-            error_msg = f"Ошибка получения статуса сетки ({symbol}/{magic_number}): {e}"
-            print(error_msg)
-            return {
-                "success": False,
-                "orders": [],
-                "positions": [],
-                "error": error_msg
-            }
+    sell_request = {
+        "action": mt5.TRADE_ACTION_PENDING,
+        "symbol": symbol,
+        "volume": initial_lot,
+        "type": mt5.ORDER_TYPE_SELL_STOP,
+        "price": sell_stop_price,
+        "magic": magic,
+        "comment": "Grid Initial SellStop",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": symbol_info.filling_mode
+    }
 
-    def place_initial_grid(
-        self,
-        symbol: str,
-        distance_pips: int,
-        lot: float,
-        percent: float,
-        magic_number: int
-    ) -> Tuple[bool, str]:
-        symbol_ok, message = self.select_symbol(symbol)
-        if not symbol_ok:
-            return False, message
+    # Send orders
+    buy_result = mt5_api.send_order(buy_request)
+    sell_result = mt5_api.send_order(sell_request)
+    
+    orders_placed_count = 0
+    buy_success = False
+    sell_success = False
 
-        current_balance = self.get_account_balance()
-        if current_balance is None:
-            return False, "Не удалось получить баланс счета."
+    # Check BuyStop result
+    if buy_result and buy_result.order > 0 and buy_result.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
+        logger.info(f"Initial BuyStop order accepted/placed successfully. Ticket: {buy_result.order}")
+        orders_placed_count += 1
+        buy_success = True
+    else:
+        logger.error(f"Failed to place initial BuyStop order. Result: {buy_result}")
 
-        # Calculate lot size based on account balance and risk percentage
-        symbol_info = mt5_api.get_symbol_info(symbol)
-        if not symbol_info["success"] or not symbol_info["data"]:
-            return False, f"Не удалось получить информацию о символе {symbol}."
-            
-        volume_step = symbol_info["data"].get("volume_step", 0.01)
-        calculated_lot = round((current_balance * percent / 100 * lot) / volume_step) * volume_step
+    # Check SellStop result
+    if sell_result and sell_result.order > 0 and sell_result.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
+        logger.info(f"Initial SellStop order accepted/placed successfully. Ticket: {sell_result.order}")
+        orders_placed_count += 1
+        sell_success = True
+    else:
+        logger.error(f"Failed to place initial SellStop order. Result: {sell_result}")
+
+    if orders_placed_count > 0:
+        # Only update state if at least one order was placed successfully
+        state['initialized'] = True
+        if buy_success:
+             state['initial_buy_stop_level'] = buy_stop_price
+             state['last_placed_buy_lot'] = initial_lot
+             state['next_buy_lot'] = round(initial_lot * const.LOT_MULTIPLIER, 2)
+        if sell_success:
+            state['initial_sell_stop_level'] = sell_stop_price
+            state['last_placed_sell_lot'] = initial_lot
+            state['next_sell_lot'] = round(initial_lot * const.LOT_MULTIPLIER, 2)
         
-        if calculated_lot <= 0:
-            calculated_lot = 0.01
-            
-        print(f"Рассчитанный лот для {symbol}: {calculated_lot}")
+        # Store initial deposit only once
+        if 'initial_deposit' not in state:
+             state['initial_deposit'] = account_info.equity # Use equity at init time
+             logger.info(f"Recorded initial deposit for drawdown calculation: {state['initial_deposit']}")
+             
+        logger.info(f"Strategy initialized partially or fully ({orders_placed_count} orders). State updated.")
+        # Consider returning True even if only one order succeeded, 
+        # the logic in check_and_manage_grid should handle inconsistencies.
+        return True # Indicate state potentially changed
+    else:
+        logger.error("Failed to place any initial orders.")
+        return False
 
-        try:
-            buy_result = self._place_buy_stop_order(symbol, distance_pips, calculated_lot, magic_number)
-            sell_result = self._place_sell_stop_order(symbol, distance_pips, calculated_lot, magic_number)
-            
-            order_results = {
-                "buy": buy_result,
-                "sell": sell_result
-            }
-        except Exception as e:
-            return False, f"Ошибка при размещении ордеров: {e}"
+# TODO: Add check_drawdown_and_close_all(state)
 
-        buy_result = order_results.get("buy", {})
-        sell_result = order_results.get("sell", {})
+def check_and_manage_grid(state):
+    logger.debug("Checking and managing grid...")
+    symbol = const.SYMBOL
+    magic = const.MAGIC_NUMBER
+    state_changed = False
 
-        success = buy_result.get("success", False) and sell_result.get("success", False)
-        message = f"Результат установки сетки для {symbol} (Лот: {calculated_lot}, Дист: {distance_pips} пипсов, Magic: {magic_number}):\n"
-        message += f"  BuyStop: {buy_result.get('message', 'Нет данных')}\n"
-        message += f"  SellStop: {sell_result.get('message', 'Нет данных')}"
+    if not state.get('initialized', False):
+        logger.debug("Strategy not initialized, skipping grid management.")
+        return False
 
-        if not success:
-            message += "\n\n⚠️ Не все ордера были установлены успешно."
+    # Get current market state
+    orders = mt5_api.get_orders(symbol=symbol, magic=magic)
+    positions = mt5_api.get_positions(symbol=symbol, magic=magic)
+    symbol_info = mt5_api.get_symbol_info(symbol)
+    if not symbol_info:
+        logger.error("Cannot manage grid: failed to get symbol info.")
+        return False
 
-        return success, message
+    # --- Identify triggered orders --- 
+    # An order is considered triggered if it no longer exists in the orders list,
+    # but a position with the corresponding direction and volume potentially exists.
+    # We need the state to know what orders *should* exist.
 
-    def _place_buy_stop_order(self, symbol: str, distance_pips: int, lot_size: float, magic_number: int) -> Dict[str, Any]:
-        try:
-            symbol_info = mt5.symbol_info(symbol)
-            if not symbol_info:
-                return {"success": False, "message": f"Не удалось получить информацию о символе {symbol}"}
+    # Get expected order tickets from state (if stored)
+    # For simplicity now, let's find orders by type and price level
+    expected_buy_stop_level = state.get('initial_buy_stop_level')
+    expected_sell_stop_level = state.get('initial_sell_stop_level')
+
+    active_buy_stop = None
+    active_sell_stop = None
+    for o in orders:
+        if o.type == mt5.ORDER_TYPE_BUY_STOP and o.price_open == expected_buy_stop_level:
+            active_buy_stop = o
+        elif o.type == mt5.ORDER_TYPE_SELL_STOP and o.price_open == expected_sell_stop_level:
+            active_sell_stop = o
             
-            point = symbol_info.point
-            digits = symbol_info.digits
-            current_price = mt5.symbol_info_tick(symbol).ask
-            
-            price = current_price + (distance_pips * 10 * point)
-            price = round(price, digits)
-            
-            request = {
-                "action": mt5.TRADE_ACTION_PENDING,
-                "symbol": symbol,
-                "volume": lot_size,
-                "type": mt5.ORDER_TYPE_BUY_STOP,
-                "price": price,
-                "deviation": 20,
-                "magic": magic_number,
-                "comment": f"BuyStop Grid {magic_number}",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_RETURN,
-            }
-            
-            result = mt5.order_send(request)
-            
-            if result.retcode == mt5.TRADE_RETCODE_DONE:
-                return {"success": True, "message": f"Ордер BuyStop размещен по цене {price}"}
+    # --- Check Buy Trigger --- 
+    # If we expected a buy stop, but it's gone, assume it triggered (or was cancelled externally)
+    # A more robust check involves matching position entry price/time or order fill history
+    buy_triggered = False
+    if expected_buy_stop_level and not active_buy_stop:
+        # Check if a corresponding BUY position exists (simplistic check)
+        # We need to know the *last placed* buy lot to potentially match volume
+        last_buy_lot = state.get('last_placed_buy_lot')
+        if any(p.type == mt5.POSITION_TYPE_BUY and p.volume == last_buy_lot for p in positions):
+             logger.info(f"Detected potential BuyStop trigger at level {expected_buy_stop_level}.")
+             buy_triggered = True
+             # Action implemented below
+             state_changed = True
+
+    # --- Check Sell Trigger --- 
+    # Similar logic for sell side
+    sell_triggered = False
+    if expected_sell_stop_level and not active_sell_stop:
+        last_sell_lot = state.get('last_placed_sell_lot')
+        # Ensure last_sell_lot is not None before comparison
+        if last_sell_lot is not None and any(p.type == mt5.POSITION_TYPE_SELL and p.volume == last_sell_lot for p in positions):
+             logger.info(f"Detected potential SellStop trigger at level {expected_sell_stop_level}.")
+             sell_triggered = True
+             # Action implemented below
+             state_changed = True
+             
+    # --- Implement Actions based on triggers --- 
+    if buy_triggered:
+        logger.info("Handling Buy trigger...")
+        # 1. Cancel existing SellStop (if any)
+        if active_sell_stop:
+            logger.info(f"Attempting to cancel SellStop order {active_sell_stop.ticket}")
+            cancel_success = mt5_api.cancel_order(active_sell_stop.ticket)
+            if not cancel_success:
+                logger.warning(f"Failed to cancel SellStop {active_sell_stop.ticket}, continuing but state might be inconsistent.")
             else:
-                return {"success": False, "message": f"Ошибка размещения BuyStop: {result.retcode}"}
-        except Exception as e:
-            return {"success": False, "message": f"Исключение при размещении BuyStop: {e}"}
+                 logger.info(f"Cancelled SellStop order {active_sell_stop.ticket}")
+        else:
+             logger.info("Buy triggered, and no active SellStop order found (expected if grid just started or after previous trigger).")
+        
+        # 2. Place new SellStop
+        new_sell_lot = state.get('next_sell_lot')
+        sell_level = state.get('initial_sell_stop_level') 
+        last_buy_lot = state.get('last_placed_buy_lot') # Lot of the position that just triggered
 
-    def _place_sell_stop_order(self, symbol: str, distance_pips: int, lot_size: float, magic_number: int) -> Dict[str, Any]:
-        try:
-            symbol_info = mt5.symbol_info(symbol)
-            if not symbol_info:
-                return {"success": False, "message": f"Не удалось получить информацию о символе {symbol}"}
-            
-            point = symbol_info.point
-            digits = symbol_info.digits
-            current_price = mt5.symbol_info_tick(symbol).bid
-            
-            price = current_price - (distance_pips * 10 * point)
-            price = round(price, digits)
-            
-            request = {
-                "action": mt5.TRADE_ACTION_PENDING,
-                "symbol": symbol,
-                "volume": lot_size,
-                "type": mt5.ORDER_TYPE_SELL_STOP,
-                "price": price,
-                "deviation": 20,
-                "magic": magic_number,
-                "comment": f"SellStop Grid {magic_number}",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_RETURN,
-            }
-            
-            result = mt5.order_send(request)
-            
-            if result.retcode == mt5.TRADE_RETCODE_DONE:
-                return {"success": True, "message": f"Ордер SellStop размещен по цене {price}"}
+        if new_sell_lot and sell_level and last_buy_lot:
+             # Ensure lot meets symbol's volume constraints
+             new_sell_lot = max(new_sell_lot, symbol_info.volume_min)
+             new_sell_lot = min(new_sell_lot, symbol_info.volume_max)
+             if symbol_info.volume_step > 0:
+                new_sell_lot = math.floor(new_sell_lot / symbol_info.volume_step) * symbol_info.volume_step
+             new_sell_lot = round(new_sell_lot, 2)
+
+             if new_sell_lot > 0:
+                logger.info(f"Placing new SellStop at {sell_level} with lot {new_sell_lot}")
+                sell_request = {
+                    "action": mt5.TRADE_ACTION_PENDING,
+                    "symbol": symbol,
+                    "volume": new_sell_lot,
+                    "type": mt5.ORDER_TYPE_SELL_STOP,
+                    "price": sell_level,
+                    "magic": magic,
+                    "comment": f"Grid SellStop after Buy trigger",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": symbol_info.filling_mode
+                }
+                sell_result = mt5_api.send_order(sell_request)
+                if sell_result and sell_result.order > 0 and sell_result.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
+                    logger.info(f"New SellStop order accepted/placed successfully. Ticket: {sell_result.order}")
+                    # Update state AFTER successful placement
+                    state['last_placed_sell_lot'] = new_sell_lot
+                    state['next_buy_lot'] = round(last_buy_lot * const.LOT_MULTIPLIER, 2) # Calculate next lot based on the one that TRIGGERED
+                    logger.info(f"State updated: last_placed_sell_lot={state['last_placed_sell_lot']}, next_buy_lot={state['next_buy_lot']}")
+                else:
+                    logger.error(f"Failed to place new SellStop order. Result: {sell_result}. State not updated for this action.")
+                    state_changed = False # Revert state change if this crucial step failed
+             else:
+                 logger.error(f"Calculated new sell lot is zero or negative ({new_sell_lot}). Cannot place order.")
+                 state_changed = False
+        else:
+            logger.error("Cannot place new SellStop: Missing required state variables (next_sell_lot, initial_sell_stop_level, last_placed_buy_lot).")
+            state_changed = False
+
+    if sell_triggered:
+        logger.info("Handling Sell trigger...")
+        # 1. Cancel existing BuyStop (if any)
+        if active_buy_stop:
+            logger.info(f"Attempting to cancel BuyStop order {active_buy_stop.ticket}")
+            cancel_success = mt5_api.cancel_order(active_buy_stop.ticket)
+            if not cancel_success:
+                logger.warning(f"Failed to cancel BuyStop {active_buy_stop.ticket}, continuing but state might be inconsistent.")
             else:
-                return {"success": False, "message": f"Ошибка размещения SellStop: {result.retcode}"}
-        except Exception as e:
-            return {"success": False, "message": f"Исключение при размещении SellStop: {e}"}
+                logger.info(f"Cancelled BuyStop order {active_buy_stop.ticket}")
+        else:
+             logger.info("Sell triggered, and no active BuyStop order found (expected if grid just started or after previous trigger).")
+             
+        # 2. Place new BuyStop
+        new_buy_lot = state.get('next_buy_lot')
+        buy_level = state.get('initial_buy_stop_level')
+        last_sell_lot = state.get('last_placed_sell_lot') # Lot of the position that just triggered
 
-    def close_grid(self, symbol: str, magic_number: int) -> Tuple[bool, str, List[str]]:
-        symbol_ok, msg = self.select_symbol(symbol)
-        if not symbol_ok:
-            print(f"Предупреждение при закрытии сетки: {msg}")
-        
-        report = mt5_api.close_positions_and_orders(symbol, magic_number)
-        
-        success = report.get("status") == "success"
-        message = report.get("message", "Не удалось получить сообщение о закрытии.")
-        details = report.get("details", [])
-        
-        return success, message, details
+        if new_buy_lot and buy_level and last_sell_lot:
+             # Ensure lot meets symbol's volume constraints
+             new_buy_lot = max(new_buy_lot, symbol_info.volume_min)
+             new_buy_lot = min(new_buy_lot, symbol_info.volume_max)
+             if symbol_info.volume_step > 0:
+                 new_buy_lot = math.floor(new_buy_lot / symbol_info.volume_step) * symbol_info.volume_step
+             new_buy_lot = round(new_buy_lot, 2)
+
+             if new_buy_lot > 0:
+                logger.info(f"Placing new BuyStop at {buy_level} with lot {new_buy_lot}")
+                buy_request = {
+                    "action": mt5.TRADE_ACTION_PENDING,
+                    "symbol": symbol,
+                    "volume": new_buy_lot,
+                    "type": mt5.ORDER_TYPE_BUY_STOP,
+                    "price": buy_level,
+                    "magic": magic,
+                    "comment": f"Grid BuyStop after Sell trigger",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": symbol_info.filling_mode
+                }
+                buy_result = mt5_api.send_order(buy_request)
+                if buy_result and buy_result.order > 0 and buy_result.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
+                    logger.info(f"New BuyStop order accepted/placed successfully. Ticket: {buy_result.order}")
+                    # Update state AFTER successful placement
+                    state['last_placed_buy_lot'] = new_buy_lot
+                    state['next_sell_lot'] = round(last_sell_lot * const.LOT_MULTIPLIER, 2) # Calculate next lot based on the one that TRIGGERED
+                    logger.info(f"State updated: last_placed_buy_lot={state['last_placed_buy_lot']}, next_sell_lot={state['next_sell_lot']}")
+                else:
+                    logger.error(f"Failed to place new BuyStop order. Result: {buy_result}. State not updated for this action.")
+                    state_changed = False # Revert state change if this crucial step failed
+             else:
+                 logger.error(f"Calculated new buy lot is zero or negative ({new_buy_lot}). Cannot place order.")
+                 state_changed = False
+        else:
+             logger.error("Cannot place new BuyStop: Missing required state variables (next_buy_lot, initial_buy_stop_level, last_placed_sell_lot).")
+             state_changed = False
+
+    # Ensure state_changed reflects if *any* action successfully modified the state
+    # The logic above sets state_changed = False if placing the new order fails.
+    if state_changed:
+        logger.info("Grid managed. State updated.") # Changed log message slightly
+
+    return state_changed
+
+if __name__ == '__main__':
+    logger.info("trading_service.py executed directly (for testing/example)")
+    # Example usage or tests can be placed here
+    pass

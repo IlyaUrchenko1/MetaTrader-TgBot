@@ -1,32 +1,31 @@
-ADMIN_IDS = {7814530746}  # ID администраторов бота
+# MetaTrader 5 Connection
+# MT5_TERMINAL_PATH = None # Path to the MetaTrader 5 terminal installation. If None, attempts to find it automatically.
+# Add MT5 login credentials if needed, or manage them via the terminal UI / environment variables.
+# MT5_LOGIN = 123456
+# MT5_PASSWORD = "your_password"
+# MT5_SERVER = "YourBroker-Server"
 
-BOT_USERNAME = "MetaTrader10_bot"  # Имя бота в Telegram
+# Trading Parameters from TZ
+SYMBOL = "EURUSD"  # Symbol for trading
 
-# Параметры торговли
-SYMBOL = "USDJPY"  # Торговый инструмент
-LOT = 0.01  # Размер лота
-PERCENT = 1.0  # Процент от баланса для расчета лота
-K_LOT = 2.0  # Множитель для увеличения лота
-DISTANCE_PIPS = 50  # Расстояние до ордеров в пипсах
-TRAILING_START = 20  # Расстояние для начала трейлинга
-TRAILING_DISTANCE = 15  # Расстояние трейлинга
-MAX_DRAWDOWN_PCT = 30  # Максимальная просадка в процентах
-MAGIC_NUMBER = 123456  # Идентификатор эксперта
-DISTANCE = 100
-LOT_BY_BALANCE = 2.0
-LOT_MULTIPLIER = 2.0
+INITIAL_LOT = 0.0  # Initial lot size. If 0, calculate based on BALANCE_PERCENT_FOR_LOT.
+BALANCE_PERCENT_FOR_LOT = 1.0  # Percentage of balance for initial lot calculation (e.g., 1.0 = 1%). Only used if INITIAL_LOT is 0.
 
-def update_symbol(new_symbol: str) -> bool:
-    """Обновляет торговый символ"""
-    global SYMBOL
-    try:
-        import MetaTrader5 as mt5
-        if not mt5.initialize():
-            return False
-        symbol_info = mt5.symbol_info(new_symbol)
-        if symbol_info is None or not symbol_info.visible:
-            return False
-        SYMBOL = new_symbol
-        return True
-    except Exception:
-        return False
+LOT_MULTIPLIER = 1.5  # K_Lot: Multiplier for subsequent orders in the grid
+
+ORDER_DISTANCE_PIPS = 20  # Distance from current price for initial BuyStop/SellStop orders (in pips)
+
+# TRAILING_STOP_START_PIPS = 0 # Not used according to refined logic
+# TRAILING_STOP_DISTANCE_PIPS = 15 # Not used according to refined logic
+
+MAX_DRAWDOWN_PERCENT = 20.0  # Maximum allowed drawdown percentage from the initial deposit before closing all positions/orders.
+
+MAGIC_NUMBER = 12345  # Magic number to identify EA's orders and positions
+
+# Other Settings
+DEFAULT_DEVIATION = 10  # Default slippage/deviation in points for market order execution (not directly used by stop orders, but might be useful later)
+RETRY_COUNT = 3         # Number of retries for failed operations (e.g., order placement)
+RETRY_DELAY_SECONDS = 2 # Delay between retries in seconds
+STATE_FILE = "state.json" # File to store the robot's state
+LOG_FILE = "mt5_bot.log" # File for logging (if file logging is enabled in logger.py)
+LOOP_DELAY_SECONDS = 5  # Delay in seconds for the main loop cycle

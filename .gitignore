@@ -102,7 +102,6 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-.env
 .venv
 env/
 venv/
@@ -135,7 +134,6 @@ dmypy.json
 cython_debug/
 
 # dotenv
-.env
 
 # Local virtualenv
 .venv/
