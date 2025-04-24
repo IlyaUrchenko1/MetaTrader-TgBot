@@ -184,7 +184,101 @@ def initialize_strategy(state):
         logger.error("Failed to place any initial orders.")
         return False
 
-# TODO: Add check_drawdown_and_close_all(state)
+def check_drawdown_and_close_all(state):
+    initial_deposit = state.get('initial_deposit')
+    if not initial_deposit:
+        # Cannot check drawdown if initial deposit wasn't recorded
+        return False
+
+    account_info = mt5_api.get_account_info()
+    if not account_info:
+        logger.warning("Cannot check drawdown: failed to get account info.")
+        return False
+
+    current_equity = account_info.equity
+    max_dd_percent = const.MAX_DRAWDOWN_PERCENT
+    
+    # Calculate drawdown
+    drawdown = initial_deposit - current_equity
+    drawdown_percent = (drawdown / initial_deposit) * 100 if initial_deposit > 0 else 0
+
+    logger.debug(f"Drawdown Check: Initial={initial_deposit}, Current Equity={current_equity}, DD={drawdown:.2f} ({drawdown_percent:.2f}%), Max Allowed={max_dd_percent}%")
+
+    if drawdown_percent >= max_dd_percent:
+        logger.warning(f"MAX DRAWDOWN LIMIT REACHED: {drawdown_percent:.2f}% >= {max_dd_percent}%! Closing all positions and orders for magic {const.MAGIC_NUMBER}!")
+        symbol = const.SYMBOL
+        magic = const.MAGIC_NUMBER
+        closed_count = 0
+        cancelled_count = 0
+
+        # 1. Close all open positions
+        positions = mt5_api.get_positions(symbol=symbol, magic=magic)
+        logger.info(f"Closing {len(positions)} positions...")
+        for pos in positions:
+            pos_type = pos.type
+            pos_volume = pos.volume
+            pos_symbol = pos.symbol
+            pos_ticket = pos.ticket
+
+            # Determine opposite action type
+            close_action_type = mt5.ORDER_TYPE_SELL if pos_type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+            
+            # Get current price for closing
+            tick = mt5_api.get_symbol_tick(pos_symbol)
+            if not tick:
+                logger.error(f"Could not get tick for {pos_symbol} to close position {pos_ticket}. Skipping.")
+                continue
+                
+            price = tick.bid if close_action_type == mt5.ORDER_TYPE_SELL else tick.ask
+            
+            close_request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "position": pos_ticket,
+                "symbol": pos_symbol,
+                "volume": pos_volume,
+                "type": close_action_type,
+                "price": price,
+                "deviation": const.DEFAULT_DEVIATION, # Allow some slippage for market close
+                "magic": magic,
+                "comment": "Drawdown Stop Out",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC, # IOC or FOK commonly used for closing
+            }
+            
+            logger.info(f"Sending close request for position {pos_ticket} ({pos_symbol} {pos_type} {pos_volume})")
+            result = mt5_api.send_order(close_request)
+            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                 logger.info(f"Successfully closed position {pos_ticket}. Result: {result}")
+                 closed_count += 1
+            else:
+                 logger.error(f"Failed to close position {pos_ticket}. Result: {result}")
+                 # Continue trying to close others
+
+        # 2. Cancel all pending orders
+        orders = mt5_api.get_orders(symbol=symbol, magic=magic)
+        logger.info(f"Cancelling {len(orders)} pending orders...")
+        for order in orders:
+            if mt5_api.cancel_order(order.ticket):
+                cancelled_count += 1
+            # cancel_order already logs errors
+
+        logger.warning(f"Drawdown Stop Out complete. Closed {closed_count}/{len(positions)} positions. Cancelled {cancelled_count}/{len(orders)} orders.")
+
+        # 3. Reset state (keep initial_deposit for potential future reference?)
+        state['initialized'] = False
+        state.pop('initial_buy_stop_level', None)
+        state.pop('initial_sell_stop_level', None)
+        state.pop('next_buy_lot', None)
+        state.pop('next_sell_lot', None)
+        state.pop('last_placed_buy_lot', None)
+        state.pop('last_placed_sell_lot', None)
+        # state.pop('initial_deposit', None) # Optional: Decide whether to keep or remove
+        logger.info("Strategy state has been reset due to drawdown stop out.")
+        
+        return True # Indicate that stop out occurred
+    else:
+        # Drawdown is within limits
+        return False
 
 def check_and_manage_grid(state):
     logger.debug("Checking and managing grid...")
@@ -284,7 +378,7 @@ def check_and_manage_grid(state):
                     "type": mt5.ORDER_TYPE_SELL_STOP,
                     "price": sell_level,
                     "magic": magic,
-                    "comment": f"Grid SellStop after Buy trigger",
+                    "comment": "Grid Sell",
                     "type_time": mt5.ORDER_TIME_GTC,
                     "type_filling": symbol_info.filling_mode
                 }
@@ -294,7 +388,9 @@ def check_and_manage_grid(state):
                     # Update state AFTER successful placement
                     state['last_placed_sell_lot'] = new_sell_lot
                     state['next_buy_lot'] = round(last_buy_lot * const.LOT_MULTIPLIER, 2) # Calculate next lot based on the one that TRIGGERED
-                    logger.info(f"State updated: last_placed_sell_lot={state['last_placed_sell_lot']}, next_buy_lot={state['next_buy_lot']}")
+                    # Mark the buy trigger as handled by removing its level from state
+                    state.pop('initial_buy_stop_level', None)
+                    logger.info(f"State updated: last_placed_sell_lot={state.get('last_placed_sell_lot')}, next_buy_lot={state.get('next_buy_lot')}, initial_buy_stop_level removed.")
                 else:
                     logger.error(f"Failed to place new SellStop order. Result: {sell_result}. State not updated for this action.")
                     state_changed = False # Revert state change if this crucial step failed
@@ -340,7 +436,7 @@ def check_and_manage_grid(state):
                     "type": mt5.ORDER_TYPE_BUY_STOP,
                     "price": buy_level,
                     "magic": magic,
-                    "comment": f"Grid BuyStop after Sell trigger",
+                    "comment": "Grid Buy",
                     "type_time": mt5.ORDER_TIME_GTC,
                     "type_filling": symbol_info.filling_mode
                 }
@@ -350,7 +446,9 @@ def check_and_manage_grid(state):
                     # Update state AFTER successful placement
                     state['last_placed_buy_lot'] = new_buy_lot
                     state['next_sell_lot'] = round(last_sell_lot * const.LOT_MULTIPLIER, 2) # Calculate next lot based on the one that TRIGGERED
-                    logger.info(f"State updated: last_placed_buy_lot={state['last_placed_buy_lot']}, next_sell_lot={state['next_sell_lot']}")
+                    # Mark the sell trigger as handled by removing its level from state
+                    state.pop('initial_sell_stop_level', None)
+                    logger.info(f"State updated: last_placed_buy_lot={state.get('last_placed_buy_lot')}, next_sell_lot={state.get('next_sell_lot')}, initial_sell_stop_level removed.")
                 else:
                     logger.error(f"Failed to place new BuyStop order. Result: {buy_result}. State not updated for this action.")
                     state_changed = False # Revert state change if this crucial step failed

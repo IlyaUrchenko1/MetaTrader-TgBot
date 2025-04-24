@@ -1,6 +1,7 @@
 import MetaTrader5 as mt5
 from utils.logger import logger
 import time
+import utils.constants as const # Import constants for retry logic
 
 def connect_mt5():
     if not mt5.initialize():
@@ -98,32 +99,87 @@ def cancel_order(ticket):
     request = {
         "action": mt5.TRADE_ACTION_REMOVE, # Action type for removing pending orders
         "order": ticket,
-        "comment": "Grid Strategy: Canceling order"
+        "comment": "Cancel Grid Order" # Simplified comment
     }
-    result = send_order(request) # Use our send_order wrapper
+    result = send_order(request) # Uses the improved send_order
+    # Check specifically for TRADE_RETCODE_DONE for cancellation
     if result and result.retcode == mt5.TRADE_RETCODE_DONE:
         logger.info(f"Successfully cancelled order ticket: {ticket}, result: {result}")
         return True
     else:
-        logger.error(f"Failed to cancel order ticket: {ticket}, result: {result}")
+        # Error already logged in send_order if it failed completely
+        if result: # Log specific failure reason if result exists but code is wrong
+            logger.error(f"Failed to cancel order ticket: {ticket}, retcode: {result.retcode}, comment: {result.comment}")
+        else: # Log if send_order returned None
+             logger.error(f"Failed to cancel order ticket: {ticket}, send_order returned None")
         return False
 
 def send_order(request):
-    # Simple wrapper for now, retry logic can be added here or in trading_service
-    logger.debug(f"Sending order request: {request}")
-    try:
-        result = mt5.order_send(request)
-        if result is None:
-            logger.error(f"order_send failed, error code = {mt5.last_error()}")
-            return None
-        logger.info(f"Order send result: {result}")
-        # Basic check for common errors (could be expanded)
-        if result.retcode not in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
-             logger.warning(f"Order send request executed with code: {result.retcode}, comment: {result.comment}")
-        return result
-    except Exception as e:
-        logger.error(f"Exception during order_send: {e}")
-        return None
+    """Sends an order request to MetaTrader 5 with retry logic."""
+    for attempt in range(const.RETRY_COUNT):
+        logger.debug(f"Sending order request (Attempt {attempt + 1}/{const.RETRY_COUNT}): {request}")
+        try:
+            result = mt5.order_send(request)
+            
+            if result is None:
+                last_error = mt5.last_error()
+                logger.error(f"order_send failed on attempt {attempt + 1}. Error code = {last_error}")
+                # Check if the error suggests retrying might help (e.g., connection issues, timeout)
+                # This requires knowledge of specific error codes, for now, retry on None result
+                if attempt < const.RETRY_COUNT - 1:
+                    logger.info(f"Waiting {const.RETRY_DELAY_SECONDS}s before retrying...")
+                    time.sleep(const.RETRY_DELAY_SECONDS)
+                    continue # Go to the next attempt
+                else:
+                    return None # Max retries reached
+            
+            logger.info(f"Order send attempt {attempt + 1} result: {result}")
+
+            # Check return code for success or specific retryable errors
+            # Success codes depend on action type (e.g., PLACED/DONE for pending/remove, DONE for market close)
+            success_codes = (
+                mt5.TRADE_RETCODE_PLACED, 
+                mt5.TRADE_RETCODE_DONE, 
+                mt5.TRADE_RETCODE_DONE_PARTIAL # Consider partial fills success for market orders if applicable
+            )
+            retryable_codes = (
+                mt5.TRADE_RETCODE_REQUOTE, 
+                mt5.TRADE_RETCODE_PRICE_OFF, 
+                mt5.TRADE_RETCODE_CONNECTION, 
+                mt5.TRADE_RETCODE_TIMEOUT
+                # Add other potentially temporary error codes here
+            )
+
+            if result.retcode in success_codes:
+                logger.debug(f"Order request successful with code {result.retcode}.")
+                return result # Success!
+            elif result.retcode in retryable_codes:
+                logger.warning(f"Order send attempt {attempt + 1} resulted in retryable code: {result.retcode} ({result.comment}).")
+                if attempt < const.RETRY_COUNT - 1:
+                    logger.info(f"Waiting {const.RETRY_DELAY_SECONDS}s before retrying...")
+                    time.sleep(const.RETRY_DELAY_SECONDS)
+                    continue # Go to the next attempt
+                else:
+                    logger.error(f"Max retries reached for retryable error code {result.retcode}.")
+                    return result # Return the last result even if it's an error
+            else:
+                # Non-retryable error code (e.g., invalid params, no money)
+                logger.error(f"Order send attempt {attempt + 1} failed with non-retryable code: {result.retcode} ({result.comment}).")
+                return result # Return the error result immediately
+
+        except Exception as e:
+            logger.error(f"Exception during order_send attempt {attempt + 1}: {e}", exc_info=True)
+            if attempt < const.RETRY_COUNT - 1:
+                 logger.info(f"Waiting {const.RETRY_DELAY_SECONDS}s before retrying after exception...")
+                 time.sleep(const.RETRY_DELAY_SECONDS)
+                 continue # Go to the next attempt
+            else:
+                logger.error("Max retries reached after exception in order_send.")
+                return None # Failed after retries
+                
+    # Should not be reached if loop completes correctly, but as a fallback:
+    logger.error("send_order finished all retries without returning a result.")
+    return None
 
 # Functions for interacting with the MetaTrader 5 API will go here
 # e.g., get_symbol_info, get_account_info, place_order, etc.
